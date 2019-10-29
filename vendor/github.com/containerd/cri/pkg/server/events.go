@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd"
 	eventtypes "github.com/containerd/containerd/api/events"
 	containerdio "github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
@@ -31,6 +32,7 @@ import (
 	"golang.org/x/net/context"
 	"k8s.io/apimachinery/pkg/util/clock"
 
+	"github.com/containerd/cri/pkg/constants"
 	ctrdutil "github.com/containerd/cri/pkg/containerd/util"
 	"github.com/containerd/cri/pkg/store"
 	containerstore "github.com/containerd/cri/pkg/store/container"
@@ -48,13 +50,17 @@ const (
 	// Add a timeout for each event handling, events that timeout will be requeued and
 	// handled again in the future.
 	handleEventTimeout = 10 * time.Second
+
+	exitChannelSize = 1024
 )
 
 // eventMonitor monitors containerd event and updates internal state correspondingly.
 // TODO(random-liu): Handle event for each container in a separate goroutine.
 type eventMonitor struct {
-	c       *criService
-	ch      <-chan *events.Envelope
+	c  *criService
+	ch <-chan *events.Envelope
+	// exitCh receives container/sandbox exit events from exit monitors.
+	exitCh  chan *eventtypes.TaskExit
 	errCh   <-chan error
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -82,24 +88,51 @@ type backOffQueue struct {
 // Create new event monitor. New event monitor will start subscribing containerd event. All events
 // happen after it should be monitored.
 func newEventMonitor(c *criService) *eventMonitor {
-	// event subscribe doesn't need namespace.
 	ctx, cancel := context.WithCancel(context.Background())
 	return &eventMonitor{
 		c:       c,
 		ctx:     ctx,
 		cancel:  cancel,
+		exitCh:  make(chan *eventtypes.TaskExit, exitChannelSize),
 		backOff: newBackOff(),
 	}
 }
 
 // subscribe starts to subscribe containerd events.
 func (em *eventMonitor) subscribe(subscriber events.Subscriber) {
+	// note: filters are any match, if you want any match but not in namespace foo
+	// then you have to manually filter namespace foo
 	filters := []string{
-		`topic=="/tasks/exit"`,
 		`topic=="/tasks/oom"`,
 		`topic~="/images/"`,
 	}
 	em.ch, em.errCh = subscriber.Subscribe(em.ctx, filters...)
+}
+
+// startExitMonitor starts an exit monitor for a given container/sandbox.
+func (em *eventMonitor) startExitMonitor(ctx context.Context, id string, pid uint32, exitCh <-chan containerd.ExitStatus) <-chan struct{} {
+	stopCh := make(chan struct{})
+	go func() {
+		defer close(stopCh)
+		select {
+		case exitRes := <-exitCh:
+			exitStatus, exitedAt, err := exitRes.Result()
+			if err != nil {
+				logrus.WithError(err).Errorf("Failed to get task exit status for %q", id)
+				exitStatus = unknownExitCode
+				exitedAt = time.Now()
+			}
+			em.exitCh <- &eventtypes.TaskExit{
+				ContainerID: id,
+				ID:          id,
+				Pid:         pid,
+				ExitStatus:  exitStatus,
+				ExitedAt:    exitedAt,
+			}
+		case <-ctx.Done():
+		}
+	}()
+	return stopCh
 }
 
 func convertEvent(e *gogotypes.Any) (string, interface{}, error) {
@@ -109,17 +142,15 @@ func convertEvent(e *gogotypes.Any) (string, interface{}, error) {
 		return "", nil, errors.Wrap(err, "failed to unmarshalany")
 	}
 
-	switch evt.(type) {
-	case *eventtypes.TaskExit:
-		id = evt.(*eventtypes.TaskExit).ContainerID
+	switch e := evt.(type) {
 	case *eventtypes.TaskOOM:
-		id = evt.(*eventtypes.TaskOOM).ContainerID
+		id = e.ContainerID
 	case *eventtypes.ImageCreate:
-		id = evt.(*eventtypes.ImageCreate).Name
+		id = e.Name
 	case *eventtypes.ImageUpdate:
-		id = evt.(*eventtypes.ImageUpdate).Name
+		id = e.Name
 	case *eventtypes.ImageDelete:
-		id = evt.(*eventtypes.ImageDelete).Name
+		id = e.Name
 	default:
 		return "", nil, errors.New("unsupported event")
 	}
@@ -139,8 +170,24 @@ func (em *eventMonitor) start() <-chan error {
 		defer close(errCh)
 		for {
 			select {
+			case e := <-em.exitCh:
+				logrus.Debugf("Received exit event %+v", e)
+				id := e.ID
+				if em.backOff.isInBackOff(id) {
+					logrus.Infof("Events for %q is in backoff, enqueue event %+v", id, e)
+					em.backOff.enBackOff(id, e)
+					break
+				}
+				if err := em.handleEvent(e); err != nil {
+					logrus.WithError(err).Errorf("Failed to handle exit event %+v for %s", e, id)
+					em.backOff.enBackOff(id, e)
+				}
 			case e := <-em.ch:
 				logrus.Debugf("Received containerd event timestamp - %v, namespace - %q, topic - %q", e.Timestamp, e.Namespace, e.Topic)
+				if e.Namespace != constants.K8sContainerdNamespace {
+					logrus.Debugf("Ignoring events in namespace - %q", e.Namespace)
+					break
+				}
 				id, evt, err := convertEvent(e.Event)
 				if err != nil {
 					logrus.WithError(err).Errorf("Failed to convert event %+v", e)
@@ -193,15 +240,11 @@ func (em *eventMonitor) handleEvent(any interface{}) error {
 	ctx, cancel := context.WithTimeout(ctx, handleEventTimeout)
 	defer cancel()
 
-	switch any.(type) {
-	// If containerd-shim exits unexpectedly, there will be no corresponding event.
-	// However, containerd could not retrieve container state in that case, so it's
-	// fine to leave out that case for now.
-	// TODO(random-liu): [P2] Handle containerd-shim exit.
+	switch e := any.(type) {
 	case *eventtypes.TaskExit:
-		e := any.(*eventtypes.TaskExit)
 		logrus.Infof("TaskExit event %+v", e)
-		cntr, err := em.c.containerStore.Get(e.ContainerID)
+		// Use ID instead of ContainerID to rule out TaskExit event for exec.
+		cntr, err := em.c.containerStore.Get(e.ID)
 		if err == nil {
 			if err := handleContainerExit(ctx, e, cntr); err != nil {
 				return errors.Wrap(err, "failed to handle container TaskExit event")
@@ -210,8 +253,7 @@ func (em *eventMonitor) handleEvent(any interface{}) error {
 		} else if err != store.ErrNotExist {
 			return errors.Wrap(err, "can't find container for TaskExit event")
 		}
-		// Use GetAll to include sandbox in unknown state.
-		sb, err := em.c.sandboxStore.GetAll(e.ContainerID)
+		sb, err := em.c.sandboxStore.Get(e.ID)
 		if err == nil {
 			if err := handleSandboxExit(ctx, e, sb); err != nil {
 				return errors.Wrap(err, "failed to handle sandbox TaskExit event")
@@ -222,18 +264,12 @@ func (em *eventMonitor) handleEvent(any interface{}) error {
 		}
 		return nil
 	case *eventtypes.TaskOOM:
-		e := any.(*eventtypes.TaskOOM)
 		logrus.Infof("TaskOOM event %+v", e)
+		// For TaskOOM, we only care which container it belongs to.
 		cntr, err := em.c.containerStore.Get(e.ContainerID)
 		if err != nil {
 			if err != store.ErrNotExist {
 				return errors.Wrap(err, "can't find container for TaskOOM event")
-			}
-			if _, err = em.c.sandboxStore.Get(e.ContainerID); err != nil {
-				if err != store.ErrNotExist {
-					return errors.Wrap(err, "can't find sandbox for TaskOOM event")
-				}
-				return nil
 			}
 			return nil
 		}
@@ -245,15 +281,12 @@ func (em *eventMonitor) handleEvent(any interface{}) error {
 			return errors.Wrap(err, "failed to update container status for TaskOOM event")
 		}
 	case *eventtypes.ImageCreate:
-		e := any.(*eventtypes.ImageCreate)
 		logrus.Infof("ImageCreate event %+v", e)
 		return em.c.updateImage(ctx, e.Name)
 	case *eventtypes.ImageUpdate:
-		e := any.(*eventtypes.ImageUpdate)
 		logrus.Infof("ImageUpdate event %+v", e)
 		return em.c.updateImage(ctx, e.Name)
 	case *eventtypes.ImageDelete:
-		e := any.(*eventtypes.ImageDelete)
 		logrus.Infof("ImageDelete event %+v", e)
 		return em.c.updateImage(ctx, e.Name)
 	}
@@ -263,14 +296,19 @@ func (em *eventMonitor) handleEvent(any interface{}) error {
 
 // handleContainerExit handles TaskExit event for container.
 func handleContainerExit(ctx context.Context, e *eventtypes.TaskExit, cntr containerstore.Container) error {
-	if e.Pid != cntr.Status.Get().Pid {
-		// Non-init process died, ignore the event.
-		return nil
-	}
 	// Attach container IO so that `Delete` could cleanup the stream properly.
 	task, err := cntr.Container.Task(ctx,
 		func(*containerdio.FIFOSet) (containerdio.IO, error) {
-			return cntr.IO, nil
+			// We can't directly return cntr.IO here, because
+			// even if cntr.IO is nil, the cio.IO interface
+			// is not.
+			// See https://tour.golang.org/methods/12:
+			//   Note that an interface value that holds a nil
+			//   concrete value is itself non-nil.
+			if cntr.IO != nil {
+				return cntr.IO, nil
+			}
+			return nil, nil
 		},
 	)
 	if err != nil {
@@ -279,7 +317,7 @@ func handleContainerExit(ctx context.Context, e *eventtypes.TaskExit, cntr conta
 		}
 	} else {
 		// TODO(random-liu): [P1] This may block the loop, we may want to spawn a worker
-		if _, err = task.Delete(ctx); err != nil {
+		if _, err = task.Delete(ctx, containerd.WithProcessKill); err != nil {
 			if !errdefs.IsNotFound(err) {
 				return errors.Wrap(err, "failed to stop container")
 			}
@@ -307,10 +345,6 @@ func handleContainerExit(ctx context.Context, e *eventtypes.TaskExit, cntr conta
 
 // handleSandboxExit handles TaskExit event for sandbox.
 func handleSandboxExit(ctx context.Context, e *eventtypes.TaskExit, sb sandboxstore.Sandbox) error {
-	if e.Pid != sb.Status.Get().Pid {
-		// Non-init process died, ignore the event.
-		return nil
-	}
 	// No stream attached to sandbox container.
 	task, err := sb.Container.Task(ctx, nil)
 	if err != nil {
@@ -319,7 +353,7 @@ func handleSandboxExit(ctx context.Context, e *eventtypes.TaskExit, sb sandboxst
 		}
 	} else {
 		// TODO(random-liu): [P1] This may block the loop, we may want to spawn a worker
-		if _, err = task.Delete(ctx); err != nil {
+		if _, err = task.Delete(ctx, containerd.WithProcessKill); err != nil {
 			if !errdefs.IsNotFound(err) {
 				return errors.Wrap(err, "failed to stop sandbox")
 			}
@@ -327,15 +361,7 @@ func handleSandboxExit(ctx context.Context, e *eventtypes.TaskExit, sb sandboxst
 		}
 	}
 	err = sb.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
-		// NOTE(random-liu): We SHOULD NOT change UNKNOWN state here.
-		// If sandbox state is UNKNOWN when event monitor receives an TaskExit event,
-		// it means that sandbox start has failed. In that case, `RunPodSandbox` will
-		// cleanup everything immediately.
-		// Once sandbox state goes out of UNKNOWN, it becomes visable to the user, which
-		// is not what we want.
-		if status.State != sandboxstore.StateUnknown {
-			status.State = sandboxstore.StateNotReady
-		}
+		status.State = sandboxstore.StateNotReady
 		status.Pid = 0
 		return status, nil
 	})

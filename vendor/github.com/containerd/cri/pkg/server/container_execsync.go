@@ -19,17 +19,18 @@ package server
 import (
 	"bytes"
 	"io"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd"
 	containerdio "github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/oci"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	"golang.org/x/sys/unix"
 	"k8s.io/client-go/tools/remotecommand"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 
 	ctrdutil "github.com/containerd/cri/pkg/containerd/util"
 	cioutil "github.com/containerd/cri/pkg/ioutil"
@@ -69,28 +70,13 @@ type execOptions struct {
 	timeout time.Duration
 }
 
-// execInContainer executes a command inside the container synchronously, and
-// redirects stdio stream properly.
-func (c *criService) execInContainer(ctx context.Context, id string, opts execOptions) (*uint32, error) {
+func (c *criService) execInternal(ctx context.Context, container containerd.Container, id string, opts execOptions) (*uint32, error) {
 	// Cancel the context before returning to ensure goroutines are stopped.
 	// This is important, because if `Start` returns error, `Wait` will hang
 	// forever unless we cancel the context.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Get container from our container store.
-	cntr, err := c.containerStore.Get(id)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to find container %q in store", id)
-	}
-	id = cntr.ID
-
-	state := cntr.Status.Get().State()
-	if state != runtime.ContainerState_CONTAINER_RUNNING {
-		return nil, errors.Errorf("container is in %s state", criContainerStateToString(state))
-	}
-
-	container := cntr.Container
 	spec, err := container.Spec(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get container spec")
@@ -99,14 +85,16 @@ func (c *criService) execInContainer(ctx context.Context, id string, opts execOp
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to load task")
 	}
-	if opts.tty {
-		g := newSpecGenerator(spec)
-		g.AddProcessEnv("TERM", "xterm")
-		spec = g.Config
-	}
 	pspec := spec.Process
-	pspec.Args = opts.cmd
+
 	pspec.Terminal = opts.tty
+	if opts.tty {
+		if err := oci.WithEnv([]string{"TERM=xterm"})(ctx, nil, nil, spec); err != nil {
+			return nil, errors.Wrap(err, "add TERM env var to spec")
+		}
+	}
+
+	pspec.Args = opts.cmd
 
 	if opts.stdout == nil {
 		opts.stdout = cio.NewDiscardLogger()
@@ -115,7 +103,7 @@ func (c *criService) execInContainer(ctx context.Context, id string, opts execOp
 		opts.stderr = cio.NewDiscardLogger()
 	}
 	execID := util.GenerateID()
-	logrus.Debugf("Generated exec id %q for container %q", execID, id)
+	log.G(ctx).Debugf("Generated exec id %q for container %q", execID, id)
 	volatileRootDir := c.getVolatileContainerRootDir(id)
 	var execIO *cio.ExecIO
 	process, err := task.Exec(ctx, execID, pspec,
@@ -131,8 +119,8 @@ func (c *criService) execInContainer(ctx context.Context, id string, opts execOp
 	defer func() {
 		deferCtx, deferCancel := ctrdutil.DeferContext()
 		defer deferCancel()
-		if _, err := process.Delete(deferCtx); err != nil {
-			logrus.WithError(err).Errorf("Failed to delete exec process %q for container %q", execID, id)
+		if _, err := process.Delete(deferCtx, containerd.WithProcessKill); err != nil {
+			log.G(ctx).WithError(err).Errorf("Failed to delete exec process %q for container %q", execID, id)
 		}
 	}()
 
@@ -146,7 +134,7 @@ func (c *criService) execInContainer(ctx context.Context, id string, opts execOp
 
 	handleResizing(opts.resize, func(size remotecommand.TerminalSize) {
 		if err := process.Resize(ctx, uint32(size.Width), uint32(size.Height)); err != nil {
-			logrus.WithError(err).Errorf("Failed to resize process %q console for container %q", execID, id)
+			log.G(ctx).WithError(err).Errorf("Failed to resize process %q console for container %q", execID, id)
 		}
 	})
 
@@ -161,35 +149,63 @@ func (c *criService) execInContainer(ctx context.Context, id string, opts execOp
 		},
 	})
 
-	var timeoutCh <-chan time.Time
-	if opts.timeout == 0 {
-		// Do not set timeout if it's 0.
-		timeoutCh = make(chan time.Time)
-	} else {
-		timeoutCh = time.After(opts.timeout)
+	execCtx := ctx
+	if opts.timeout > 0 {
+		var execCtxCancel context.CancelFunc
+		execCtx, execCtxCancel = context.WithTimeout(ctx, opts.timeout)
+		defer execCtxCancel()
 	}
+
 	select {
-	case <-timeoutCh:
-		//TODO(Abhi) Use context.WithDeadline instead of timeout.
+	case <-execCtx.Done():
 		// Ignore the not found error because the process may exit itself before killing.
-		if err := process.Kill(ctx, unix.SIGKILL); err != nil && !errdefs.IsNotFound(err) {
+		if err := process.Kill(ctx, syscall.SIGKILL); err != nil && !errdefs.IsNotFound(err) {
 			return nil, errors.Wrapf(err, "failed to kill exec %q", execID)
 		}
 		// Wait for the process to be killed.
 		exitRes := <-exitCh
-		logrus.Infof("Timeout received while waiting for exec process kill %q code %d and error %v",
+		log.G(ctx).Infof("Timeout received while waiting for exec process kill %q code %d and error %v",
 			execID, exitRes.ExitCode(), exitRes.Error())
 		<-attachDone
-		logrus.Debugf("Stream pipe for exec process %q done", execID)
-		return nil, errors.Errorf("timeout %v exceeded", opts.timeout)
+		log.G(ctx).Debugf("Stream pipe for exec process %q done", execID)
+		return nil, errors.Wrapf(execCtx.Err(), "timeout %v exceeded", opts.timeout)
 	case exitRes := <-exitCh:
 		code, _, err := exitRes.Result()
-		logrus.Infof("Exec process %q exits with exit code %d and error %v", execID, code, err)
+		log.G(ctx).Infof("Exec process %q exits with exit code %d and error %v", execID, code, err)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed while waiting for exec %q", execID)
 		}
 		<-attachDone
-		logrus.Debugf("Stream pipe for exec process %q done", execID)
+		log.G(ctx).Debugf("Stream pipe for exec process %q done", execID)
 		return &code, nil
 	}
+}
+
+// execInContainer executes a command inside the container synchronously, and
+// redirects stdio stream properly.
+// This function only returns when the exec process exits, this means that:
+// 1) As long as the exec process is running, the goroutine in the cri plugin
+// will be running and wait for the exit code;
+// 2) `kubectl exec -it` will hang until the exec process exits, even after io
+// is detached. This is different from dockershim, which leaves the exec process
+// running in background after io is detached.
+// https://github.com/kubernetes/kubernetes/blob/v1.15.0/pkg/kubelet/dockershim/exec.go#L127
+// For example, if the `kubectl exec -it` process is killed, IO will be closed. In
+// this case, the CRI plugin will still have a goroutine waiting for the exec process
+// to exit and log the exit code, but dockershim won't.
+func (c *criService) execInContainer(ctx context.Context, id string, opts execOptions) (*uint32, error) {
+	// Get container from our container store.
+	cntr, err := c.containerStore.Get(id)
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to find container %q in store", id)
+	}
+	id = cntr.ID
+
+	state := cntr.Status.Get().State()
+	if state != runtime.ContainerState_CONTAINER_RUNNING {
+		return nil, errors.Errorf("container is in %s state", criContainerStateToString(state))
+	}
+
+	return c.execInternal(ctx, cntr.Container, id, opts)
 }

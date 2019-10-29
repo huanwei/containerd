@@ -1,4 +1,4 @@
-![containerd banner](https://raw.githubusercontent.com/cncf/artwork/master/containerd/horizontal/color/containerd-horizontal-color.png)
+![containerd banner](https://raw.githubusercontent.com/cncf/artwork/master/projects/containerd/horizontal/color/containerd-horizontal-color.png)
 
 [![GoDoc](https://godoc.org/github.com/containerd/containerd?status.svg)](https://godoc.org/github.com/containerd/containerd)
 [![Build Status](https://travis-ci.org/containerd/containerd.svg?branch=master)](https://travis-ci.org/containerd/containerd)
@@ -172,11 +172,9 @@ checkpoint, err := task.Checkpoint(context)
 err := client.Push(context, "myregistry/checkpoints/redis:master", checkpoint)
 
 // on a new machine pull the checkpoint and restore the redis container
-image, err := client.Pull(context, "myregistry/checkpoints/redis:master")
+checkpoint, err := client.Pull(context, "myregistry/checkpoints/redis:master")
 
-checkpoint := image.Target()
-
-redis, err = client.NewContainer(context, "redis-master", containerd.WithCheckpoint(checkpoint, "redis-rootfs"))
+redis, err = client.NewContainer(context, "redis-master", containerd.WithNewSnapshot("redis-rootfs", checkpoint))
 defer container.Delete(context)
 
 task, err = redis.NewTask(context, cio.Stdio, containerd.WithTaskCheckpoint(checkpoint))
@@ -212,10 +210,33 @@ See [PLUGINS.md](PLUGINS.md) for how to create plugins
 Please see [RELEASES.md](RELEASES.md) for details on versioning and stability
 of containerd components.
 
-### Development reports.
+Downloadable 64-bit Intel/AMD binaries of all official releases are available on
+our [releases page](https://github.com/containerd/containerd/releases), as well as
+auto-published to the [cri-containerd-release storage bucket](https://console.cloud.google.com/storage/browser/cri-containerd-release?pli=1).
 
-Weekly summary on the progress and what is being worked on.
-https://github.com/containerd/containerd/tree/master/reports
+For other architectures and distribution support, you will find that many
+Linux distributions package their own containerd and provide it across several
+architectures, such as [Canonical's Ubuntu packaging](https://launchpad.net/ubuntu/bionic/+package/containerd).
+
+#### Enabling command auto-completion
+
+Starting with containerd 1.4, the urfave client feature for auto-creation of bash and zsh
+autocompletion data is enabled. To use the autocomplete feature in a bash shell for example, source
+the autocomplete/ctr file in your `.bashrc`, or manually like:
+
+```
+$ source ./contrib/autocomplete/ctr
+```
+
+#### Distribution of `ctr` autocomplete for bash and zsh
+
+For bash, copy the `contrib/autocomplete/ctr` script into
+`/etc/bash_completion.d/` and rename it to `ctr`. The `zsh_autocomplete`
+file is also available and can be used similarly for zsh users.
+
+Provide documentation to users to `source` this file into their shell if
+you don't place the autocomplete file in a location where it is automatically
+loaded for the user's shell environment.
 
 ### Communication
 
@@ -225,7 +246,11 @@ This will be the best place to discuss design and implementation.
 For sync communication we have a community slack with a #containerd channel that everyone is welcome to join and chat about development.
 
 **Slack:** Catch us in the #containerd and #containerd-dev channels on dockercommunity.slack.com.
-[Click here for an invite to docker community slack.](https://join.slack.com/t/dockercommunity/shared_invite/enQtNDY4MDc1Mzc0MzIwLTgxZDBlMmM4ZGEyNDc1N2FkMzlhODJkYmE1YTVkYjM1MDE3ZjAwZjBkOGFlOTJkZjRmZGYzNjYyY2M3ZTUxYzQ)
+[Click here for an invite to docker community slack.](https://dockr.ly/slack)
+
+### Security audit
+
+A third party security audit was performed by Cure53 in 4Q2018; the [full report](docs/SECURITY_AUDIT.pdf) is available in our docs/ directory.
 
 ### Reporting security issues
 

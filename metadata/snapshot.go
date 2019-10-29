@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/filters"
 	"github.com/containerd/containerd/labels"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/metadata/boltutil"
@@ -32,6 +34,10 @@ import (
 	"github.com/containerd/containerd/snapshots"
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
+)
+
+const (
+	inheritedLabelsPrefix = "containerd.io/snapshot/"
 )
 
 type snapshotter struct {
@@ -209,6 +215,15 @@ func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 		bkey = string(sbkt.Get(bucketKeyName))
 		local.Parent = string(sbkt.Get(bucketKeyParent))
 
+		inner := snapshots.Info{
+			Name:   bkey,
+			Labels: filterInheritedLabels(local.Labels),
+		}
+
+		if _, err := s.Snapshotter.Update(ctx, inner, fieldpaths...); err != nil {
+			return err
+		}
+
 		return nil
 	}); err != nil {
 		return snapshots.Info{}, err
@@ -232,7 +247,7 @@ func overlayInfo(info, overlay snapshots.Info) snapshots.Info {
 		info.Labels = overlay.Labels
 	} else {
 		for k, v := range overlay.Labels {
-			overlay.Labels[k] = v
+			info.Labels[k] = v
 		}
 	}
 	return info
@@ -338,12 +353,14 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 			return err
 		}
 
+		inheritedOpt := snapshots.WithLabels(filterInheritedLabels(base.Labels))
+
 		// TODO: Consider doing this outside of transaction to lessen
 		// metadata lock time
 		if readonly {
-			m, err = s.Snapshotter.View(ctx, bkey, bparent)
+			m, err = s.Snapshotter.View(ctx, bkey, bparent, inheritedOpt)
 		} else {
-			m, err = s.Snapshotter.Prepare(ctx, bkey, bparent)
+			m, err = s.Snapshotter.Prepare(ctx, bkey, bparent, inheritedOpt)
 		}
 		return err
 	}); err != nil {
@@ -445,9 +462,11 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 			return err
 		}
 
+		inheritedOpt := snapshots.WithLabels(filterInheritedLabels(base.Labels))
+
 		// TODO: Consider doing this outside of transaction to lessen
 		// metadata lock time
-		return s.Snapshotter.Commit(ctx, nameKey, bkey)
+		return s.Snapshotter.Commit(ctx, nameKey, bkey, inheritedOpt)
 	})
 
 }
@@ -500,9 +519,8 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
 		}
 
 		// Mark snapshotter as dirty for triggering garbage collection
-		s.db.dirtyL.Lock()
+		atomic.AddUint32(&s.db.dirty, 1)
 		s.db.dirtySS[s.name] = struct{}{}
-		s.db.dirtyL.Unlock()
 
 		return nil
 	})
@@ -513,7 +531,7 @@ type infoPair struct {
 	info snapshots.Info
 }
 
-func (s *snapshotter) Walk(ctx context.Context, fn func(context.Context, snapshots.Info) error) error {
+func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return err
@@ -524,6 +542,11 @@ func (s *snapshotter) Walk(ctx context.Context, fn func(context.Context, snapsho
 		pairs     = []infoPair{}
 		lastKey   string
 	)
+
+	filter, err := filters.ParseAll(fs...)
+	if err != nil {
+		return err
+	}
 
 	for {
 		if err := view(ctx, s.db, func(tx *bolt.Tx) error {
@@ -587,8 +610,11 @@ func (s *snapshotter) Walk(ctx context.Context, fn func(context.Context, snapsho
 				return err
 			}
 
-			if err := fn(ctx, overlayInfo(info, pair.info)); err != nil {
-				return err
+			info = overlayInfo(info, pair.info)
+			if filter.Match(adaptSnapshot(info)) {
+				if err := fn(ctx, info); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -628,7 +654,7 @@ func (s *snapshotter) garbageCollect(ctx context.Context) (d time.Duration, err 
 			}
 		}
 		if err == nil {
-			d = time.Now().Sub(t1)
+			d = time.Since(t1)
 		}
 	}()
 
@@ -760,4 +786,20 @@ func (s *snapshotter) pruneBranch(ctx context.Context, node *treeNode) error {
 // Close closes s.Snapshotter but not db
 func (s *snapshotter) Close() error {
 	return s.Snapshotter.Close()
+}
+
+// filterInheritedLabels filters the provided labels by removing any key which doesn't have
+// a prefix of "containerd.io/snapshot/".
+func filterInheritedLabels(labels map[string]string) map[string]string {
+	if labels == nil {
+		return nil
+	}
+
+	filtered := make(map[string]string)
+	for k, v := range labels {
+		if strings.HasPrefix(k, inheritedLabelsPrefix) {
+			filtered[k] = v
+		}
+	}
+	return filtered
 }

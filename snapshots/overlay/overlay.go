@@ -282,14 +282,14 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	return t.Commit()
 }
 
-// Walk the committed snapshots.
-func (o *snapshotter) Walk(ctx context.Context, fn func(context.Context, snapshots.Info) error) error {
+// Walk the snapshots.
+func (o *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
 	ctx, t, err := o.ms.TransactionContext(ctx, false)
 	if err != nil {
 		return err
 	}
 	defer t.Rollback()
-	return storage.WalkInfo(ctx, fn)
+	return storage.WalkInfo(ctx, fn, fs...)
 }
 
 // Cleanup cleans up disk resources from removed or abandoned snapshots
@@ -350,7 +350,7 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context, t storage.Trans
 	return cleanup, nil
 }
 
-func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) ([]mount.Mount, error) {
+func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
 	ctx, t, err := o.ms.TransactionContext(ctx, true)
 	if err != nil {
 		return nil, err
@@ -426,7 +426,7 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 }
 
 func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, kind snapshots.Kind) (string, error) {
-	td, err := ioutil.TempDir(filepath.Join(o.root, "snapshots"), "new-")
+	td, err := ioutil.TempDir(snapshotDir, "new-")
 	if err != nil {
 		return "", errors.Wrap(err, "failed to create temp dir")
 	}

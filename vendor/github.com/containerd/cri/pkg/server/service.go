@@ -26,16 +26,12 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/plugin"
 	cni "github.com/containerd/go-cni"
-	runcapparmor "github.com/opencontainers/runc/libcontainer/apparmor"
-	runcseccomp "github.com/opencontainers/runc/libcontainer/seccomp"
-	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/server/streaming"
 
-	api "github.com/containerd/cri/pkg/api/v1"
 	"github.com/containerd/cri/pkg/atomic"
 	criconfig "github.com/containerd/cri/pkg/config"
 	ctrdutil "github.com/containerd/cri/pkg/containerd/util"
@@ -51,7 +47,6 @@ import (
 type grpcServices interface {
 	runtime.RuntimeServiceServer
 	runtime.ImageServiceServer
-	api.CRIPluginServiceServer
 }
 
 // CRIService is the interface implement CRI remote service server.
@@ -69,10 +64,6 @@ type criService struct {
 	config criconfig.Config
 	// imageFSPath is the path to image filesystem.
 	imageFSPath string
-	// apparmorEnabled indicates whether apparmor is enabled.
-	apparmorEnabled bool
-	// seccompEnabled indicates whether seccomp is enabled.
-	seccompEnabled bool
 	// os is an interface for all required os operations.
 	os osinterface.OS
 	// sandboxStore stores all resources associated with sandboxes.
@@ -108,8 +99,6 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 	c := &criService{
 		config:             config,
 		client:             client,
-		apparmorEnabled:    runcapparmor.IsEnabled(),
-		seccompEnabled:     runcseccomp.IsEnabled(),
 		os:                 osinterface.RealOS{},
 		sandboxStore:       sandboxstore.NewStore(),
 		containerStore:     containerstore.NewStore(),
@@ -120,14 +109,6 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 		initialized:        atomic.NewBool(false),
 	}
 
-	if c.config.EnableSelinux {
-		if !selinux.GetEnabled() {
-			logrus.Warn("Selinux is not supported")
-		}
-	} else {
-		selinux.SetDisabled()
-	}
-
 	if client.SnapshotService(c.config.ContainerdConfig.Snapshotter) == nil {
 		return nil, errors.Errorf("failed to find snapshotter %q", c.config.ContainerdConfig.Snapshotter)
 	}
@@ -135,24 +116,12 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 	c.imageFSPath = imageFSPath(config.ContainerdRootDir, config.ContainerdConfig.Snapshotter)
 	logrus.Infof("Get image filesystem path %q", c.imageFSPath)
 
-	// Pod needs to attach to atleast loopback network and a non host network,
-	// hence networkAttachCount is 2. If there are more network configs the
-	// pod will be attached to all the networks but we will only use the ip
-	// of the default network interface as the pod IP.
-	c.netPlugin, err = cni.New(cni.WithMinNetworkCount(networkAttachCount),
-		cni.WithPluginConfDir(config.NetworkPluginConfDir),
-		cni.WithPluginDir([]string{config.NetworkPluginBinDir}))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to initialize cni")
+	if err := c.initPlatform(); err != nil {
+		return nil, errors.Wrap(err, "initialize platform")
 	}
 
-	// Try to load the config if it exists. Just log the error if load fails
-	// This is not disruptive for containerd to panic
-	if err := c.netPlugin.Load(cni.WithLoNetwork, cni.WithDefaultConf); err != nil {
-		logrus.WithError(err).Error("Failed to load cni during init, please check CRI plugin status before setting up network for pods")
-	}
 	// prepare streaming server
-	c.streamServer, err = newStreamServer(c, config.StreamServerAddress, config.StreamServerPort)
+	c.streamServer, err = newStreamServer(c, config.StreamServerAddress, config.StreamServerPort, config.StreamIdleTimeout)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create stream server")
 	}
@@ -165,10 +134,15 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 // Register registers all required services onto a specific grpc server.
 // This is used by containerd cri plugin.
 func (c *criService) Register(s *grpc.Server) error {
-	instrumented := newInstrumentedService(c)
-	runtime.RegisterRuntimeServiceServer(s, instrumented)
-	runtime.RegisterImageServiceServer(s, instrumented)
-	api.RegisterCRIPluginServiceServer(s, instrumented)
+	return c.register(s)
+}
+
+// RegisterTCP register all required services onto a GRPC server on TCP.
+// This is used by containerd CRI plugin.
+func (c *criService) RegisterTCP(s *grpc.Server) error {
+	if !c.config.DisableTCPService {
+		return c.register(s)
+	}
 	return nil
 }
 
@@ -259,6 +233,13 @@ func (c *criService) Close() error {
 	if err := c.streamServer.Stop(); err != nil {
 		return errors.Wrap(err, "failed to stop stream server")
 	}
+	return nil
+}
+
+func (c *criService) register(s *grpc.Server) error {
+	instrumented := newInstrumentedService(c)
+	runtime.RegisterRuntimeServiceServer(s, instrumented)
+	runtime.RegisterImageServiceServer(s, instrumented)
 	return nil
 }
 

@@ -23,10 +23,12 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/log/logtest"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/pkg/testutil"
@@ -48,6 +50,7 @@ func SnapshotterSuite(t *testing.T, name string, snapshotterFn func(ctx context.
 	t.Run("PreareViewFailingtest", makeTest(name, snapshotterFn, checkSnapshotterPrepareView))
 	t.Run("Update", makeTest(name, snapshotterFn, checkUpdate))
 	t.Run("Remove", makeTest(name, snapshotterFn, checkRemove))
+	t.Run("Walk", makeTest(name, snapshotterFn, checkWalk))
 
 	t.Run("LayerFileupdate", makeTest(name, snapshotterFn, checkLayerFileUpdate))
 	t.Run("RemoveDirectoryInLowerLayer", makeTest(name, snapshotterFn, checkRemoveDirectoryInLowerLayer))
@@ -71,7 +74,7 @@ func makeTest(name string, snapshotterFn func(ctx context.Context, root string) 
 	return func(t *testing.T) {
 		t.Parallel()
 
-		ctx := context.Background()
+		ctx := logtest.WithT(context.Background(), t)
 		ctx = namespaces.WithNamespace(ctx, "testsuite")
 		// Make two directories: a snapshotter root and a play area for the tests:
 		//
@@ -149,11 +152,12 @@ func checkSnapshotterBasic(ctx context.Context, t *testing.T, snapshotter snapsh
 	if err := mount.All(mounts, preparing); err != nil {
 		t.Fatalf("failure reason: %+v", err)
 	}
-	defer testutil.Unmount(t, preparing)
 
 	if err := initialApplier.Apply(preparing); err != nil {
 		t.Fatalf("failure reason: %+v", err)
 	}
+	// unmount before commit
+	testutil.Unmount(t, preparing)
 
 	committed := filepath.Join(work, "committed")
 	if err := snapshotter.Commit(ctx, committed, preparing, opt); err != nil {
@@ -185,7 +189,6 @@ func checkSnapshotterBasic(ctx context.Context, t *testing.T, snapshotter snapsh
 	if err := mount.All(mounts, next); err != nil {
 		t.Fatalf("failure reason: %+v", err)
 	}
-	defer testutil.Unmount(t, next)
 
 	if err := fstest.CheckDirectoryEqualWithApplier(next, initialApplier); err != nil {
 		t.Fatalf("failure reason: %+v", err)
@@ -194,6 +197,8 @@ func checkSnapshotterBasic(ctx context.Context, t *testing.T, snapshotter snapsh
 	if err := diffApplier.Apply(next); err != nil {
 		t.Fatalf("failure reason: %+v", err)
 	}
+	// unmount before commit
+	testutil.Unmount(t, next)
 
 	ni, err := snapshotter.Stat(ctx, next)
 	if err != nil {
@@ -498,7 +503,6 @@ func checkRemoveIntermediateSnapshot(ctx context.Context, t *testing.T, snapshot
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer testutil.Unmount(t, base)
 
 	committedBase := filepath.Join(work, "committed-base")
 	if err = snapshotter.Commit(ctx, committedBase, base, opt); err != nil {
@@ -537,6 +541,7 @@ func checkRemoveIntermediateSnapshot(ctx context.Context, t *testing.T, snapshot
 	if err != nil {
 		t.Fatal(err)
 	}
+	testutil.Unmount(t, base)
 	err = snapshotter.Remove(ctx, committedBase)
 	if err != nil {
 		t.Fatal(err)
@@ -955,6 +960,138 @@ func check128LayersMount(name string) func(ctx context.Context, t *testing.T, sn
 
 		if err := fstest.CheckDirectoryEqual(view, flat); err != nil {
 			t.Fatalf("fullview should equal to flat: %+v", err)
+		}
+	}
+}
+
+func checkWalk(ctx context.Context, t *testing.T, snapshotter snapshots.Snapshotter, work string) {
+	opt := snapshots.WithLabels(map[string]string{
+		"containerd.io/gc.root": "check-walk",
+	})
+
+	// No parent active
+	if _, err := snapshotter.Prepare(ctx, "a-np", "", opt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Base parent
+	if _, err := snapshotter.Prepare(ctx, "p-tmp", "", opt); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotter.Commit(ctx, "p", "p-tmp", opt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Active
+	if _, err := snapshotter.Prepare(ctx, "a", "p", opt); err != nil {
+		t.Fatal(err)
+	}
+
+	// View
+	if _, err := snapshotter.View(ctx, "v", "p", opt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Base parent with label=1
+	if _, err := snapshotter.Prepare(ctx, "p-wl-tmp", "", opt); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotter.Commit(ctx, "p-wl", "p-wl-tmp", snapshots.WithLabels(map[string]string{
+		"l":                     "1",
+		"containerd.io/gc.root": "check-walk",
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	// active with label=2
+	if _, err := snapshotter.Prepare(ctx, "a-wl", "p-wl", snapshots.WithLabels(map[string]string{
+		"l":                     "2",
+		"containerd.io/gc.root": "check-walk",
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	// view with label=3
+	if _, err := snapshotter.View(ctx, "v-wl", "p-wl", snapshots.WithLabels(map[string]string{
+		"l":                     "3",
+		"containerd.io/gc.root": "check-walk",
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	// no parent active with label=2
+	if _, err := snapshotter.Prepare(ctx, "a-np-wl", "", snapshots.WithLabels(map[string]string{
+		"l":                     "2",
+		"containerd.io/gc.root": "check-walk",
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, tc := range []struct {
+		matches []string
+		filters []string
+	}{
+		{
+			matches: []string{"a-np", "p", "a", "v", "p-wl", "a-wl", "v-wl", "a-np-wl"},
+			filters: []string{"labels.\"containerd.io/gc.root\"==check-walk"},
+		},
+		{
+			matches: []string{"a-np", "a", "a-wl", "a-np-wl"},
+			filters: []string{"kind==active,labels.\"containerd.io/gc.root\"==check-walk"},
+		},
+		{
+			matches: []string{"v", "v-wl"},
+			filters: []string{"kind==view,labels.\"containerd.io/gc.root\"==check-walk"},
+		},
+		{
+			matches: []string{"p", "p-wl"},
+			filters: []string{"kind==committed,labels.\"containerd.io/gc.root\"==check-walk"},
+		},
+		{
+			matches: []string{"p", "a-np-wl"},
+			filters: []string{"name==p", "name==a-np-wl"},
+		},
+		{
+			matches: []string{"a-wl"},
+			filters: []string{"name==a-wl,labels.l"},
+		},
+		{
+			matches: []string{"a", "v"},
+			filters: []string{"parent==p"},
+		},
+		{
+			matches: []string{"a", "v", "a-wl", "v-wl"},
+			filters: []string{"parent,labels.\"containerd.io/gc.root\"==check-walk"},
+		},
+		{
+			matches: []string{"p-wl", "a-wl", "v-wl", "a-np-wl"},
+			filters: []string{"labels.l"},
+		},
+		{
+			matches: []string{"a-wl", "a-np-wl"},
+			filters: []string{"labels.l==2"},
+		},
+	} {
+		actual := []string{}
+		err := snapshotter.Walk(ctx, func(ctx context.Context, si snapshots.Info) error {
+			actual = append(actual, si.Name)
+			return nil
+		}, tc.filters...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sort.Strings(tc.matches)
+		sort.Strings(actual)
+		if len(actual) != len(tc.matches) {
+			t.Errorf("[%d] Unexpected result (size):\nActual:\n\t%#v\nExpected:\n\t%#v", i, actual, tc.matches)
+			continue
+		}
+		for j := range actual {
+			if actual[j] != tc.matches[j] {
+				t.Errorf("[%d] Unexpected result @%d:\nActual:\n\t%#vExpected:\n\t%#v", i, j, actual, tc.matches)
+				break
+			}
 		}
 	}
 }

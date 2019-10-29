@@ -26,7 +26,9 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cmd/ctr/commands"
 	"github.com/containerd/containerd/contrib/nvidia"
+	"github.com/containerd/containerd/contrib/seccomp"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/platforms"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
@@ -62,6 +64,9 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 			args = context.Args()[2:]
 		)
 		opts = append(opts, oci.WithDefaultSpec(), oci.WithDefaultUnixDevices)
+		if ef := context.String("env-file"); ef != "" {
+			opts = append(opts, oci.WithEnvFile(ef))
+		}
 		opts = append(opts, oci.WithEnv(context.StringSlice("env")))
 		opts = append(opts, withMounts(context))
 
@@ -73,10 +78,21 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 			opts = append(opts, oci.WithRootFSPath(rootfs))
 		} else {
 			snapshotter := context.String("snapshotter")
-			image, err := client.GetImage(ctx, ref)
+			var image containerd.Image
+			i, err := client.ImageService().Get(ctx, ref)
 			if err != nil {
 				return nil, err
 			}
+			if ps := context.String("platform"); ps != "" {
+				platform, err := platforms.Parse(ps)
+				if err != nil {
+					return nil, err
+				}
+				image = containerd.NewImageWithPlatform(client, i, platforms.Only(platform))
+			} else {
+				image = containerd.NewImage(client, i)
+			}
+
 			unpacked, err := image.IsUnpacked(ctx, snapshotter)
 			if err != nil {
 				return nil, err
@@ -109,10 +125,13 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 			opts = append(opts, oci.WithTTY)
 		}
 		if context.Bool("privileged") {
-			opts = append(opts, oci.WithPrivileged)
+			opts = append(opts, oci.WithPrivileged, oci.WithAllDevicesAllowed, oci.WithHostDevices)
 		}
 		if context.Bool("net-host") {
 			opts = append(opts, oci.WithHostNamespace(specs.NetworkNamespace), oci.WithHostHostsFile, oci.WithHostResolvconf)
+		}
+		if context.Bool("seccomp") {
+			opts = append(opts, seccomp.WithDefaultProfile())
 		}
 
 		joinNs := context.StringSlice("with-ns")
@@ -139,10 +158,18 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 			// NOTE: can be set to "" explicitly for disabling cgroup.
 			opts = append(opts, oci.WithCgroup(context.String("cgroup")))
 		}
+		limit := context.Uint64("memory-limit")
+		if limit != 0 {
+			opts = append(opts, oci.WithMemoryLimit(limit))
+		}
+		for _, dev := range context.StringSlice("device") {
+			opts = append(opts, oci.WithLinuxDevice(dev, "rwm"))
+		}
 	}
 
 	cOpts = append(cOpts, containerd.WithRuntime(context.String("runtime"), nil))
 
+	opts = append(opts, oci.WithAnnotations(commands.LabelArgs(context.StringSlice("label"))))
 	var s specs.Spec
 	spec = containerd.WithSpec(&s, opts...)
 

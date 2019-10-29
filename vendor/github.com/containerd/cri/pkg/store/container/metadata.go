@@ -20,14 +20,14 @@ import (
 	"encoding/json"
 
 	"github.com/pkg/errors"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // NOTE(random-liu):
 // 1) Metadata is immutable after created.
 // 2) Metadata is checkpointed as containerd container label.
 
-// metadataVersion  is current version of container metadata.
+// metadataVersion is current version of container metadata.
 const metadataVersion = "v1" // nolint
 
 // versionedMetadata is the internal versioned container metadata.
@@ -58,6 +58,9 @@ type Metadata struct {
 	ImageRef string
 	// LogPath is the container log path.
 	LogPath string
+	// StopSignal is the system call signal that will be sent to the container to exit.
+	// TODO(random-liu): Add integration test for stop signal.
+	StopSignal string
 }
 
 // MarshalJSON encodes Metadata into bytes in json format.

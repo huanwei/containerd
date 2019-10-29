@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/services/server"
@@ -69,6 +70,17 @@ func App() *cli.App {
 	app.Name = "containerd"
 	app.Version = version.Version
 	app.Usage = usage
+	app.Description = `
+containerd is a high performance container runtime whose daemon can be started
+by using this command. If none of the *config*, *publish*, or *help* commands
+are specified, the default action of the **containerd** command is to start the
+containerd daemon in the foreground.
+
+
+A default configuration is used if no TOML configuration is specified or located
+at the default file location. The *containerd config* command can be used to
+generate the default configuration for containerd. The output of that command
+can be used and modified as necessary as a custom configuration.`
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "config,c",
@@ -147,9 +159,15 @@ func App() *cli.App {
 		for _, w := range warnings {
 			log.G(ctx).WithError(w).Warn("cleanup temp mount")
 		}
-		address := config.GRPC.Address
-		if address == "" {
-			return errors.New("grpc address cannot be empty")
+
+		if config.GRPC.Address == "" {
+			return errors.Wrap(errdefs.ErrInvalidArgument, "grpc address cannot be empty")
+		}
+		if config.TTRPC.Address == "" {
+			// If TTRPC was not explicitly configured, use defaults based on GRPC.
+			config.TTRPC.Address = fmt.Sprintf("%s.ttrpc", config.GRPC.Address)
+			config.TTRPC.UID = config.GRPC.UID
+			config.TTRPC.GID = config.GRPC.GID
 		}
 		log.G(ctx).WithFields(logrus.Fields{
 			"version":  version.Version,
@@ -188,8 +206,22 @@ func App() *cli.App {
 			}
 			serve(ctx, l, server.ServeMetrics)
 		}
+		// setup the ttrpc endpoint
+		tl, err := sys.GetLocalListener(config.TTRPC.Address, config.TTRPC.UID, config.TTRPC.GID)
+		if err != nil {
+			return errors.Wrapf(err, "failed to get listener for main ttrpc endpoint")
+		}
+		serve(ctx, tl, server.ServeTTRPC)
 
-		l, err := sys.GetLocalListener(address, config.GRPC.UID, config.GRPC.GID)
+		if config.GRPC.TCPAddress != "" {
+			l, err := net.Listen("tcp", config.GRPC.TCPAddress)
+			if err != nil {
+				return errors.Wrapf(err, "failed to get listener for TCP grpc endpoint")
+			}
+			serve(ctx, l, server.ServeTCP)
+		}
+		// setup the main grpc endpoint
+		l, err := sys.GetLocalListener(config.GRPC.Address, config.GRPC.UID, config.GRPC.GID)
 		if err != nil {
 			return errors.Wrapf(err, "failed to get listener for main endpoint")
 		}
@@ -252,7 +284,7 @@ func setLevel(context *cli.Context, config *srvconfig.Config) error {
 		l = config.Debug.Level
 	}
 	if l != "" {
-		lvl, err := log.ParseLevel(l)
+		lvl, err := logrus.ParseLevel(l)
 		if err != nil {
 			return err
 		}
@@ -261,7 +293,7 @@ func setLevel(context *cli.Context, config *srvconfig.Config) error {
 	return nil
 }
 
-func dumpStacks() {
+func dumpStacks(writeToFile bool) {
 	var (
 		buf       []byte
 		stackSize int
@@ -274,4 +306,16 @@ func dumpStacks() {
 	}
 	buf = buf[:stackSize]
 	logrus.Infof("=== BEGIN goroutine stack dump ===\n%s\n=== END goroutine stack dump ===", buf)
+
+	if writeToFile {
+		// Also write to file to aid gathering diagnostics
+		name := filepath.Join(os.TempDir(), fmt.Sprintf("containerd.%d.stacks.log", os.Getpid()))
+		f, err := os.Create(name)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		f.WriteString(string(buf))
+		logrus.Infof("goroutine stack dump written to %s", name)
+	}
 }

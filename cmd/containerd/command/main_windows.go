@@ -24,6 +24,9 @@ import (
 	"unsafe"
 
 	winio "github.com/Microsoft/go-winio"
+	"github.com/Microsoft/go-winio/pkg/etw"
+	"github.com/Microsoft/go-winio/pkg/etwlogrus"
+	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/services/server"
 	"github.com/sirupsen/logrus"
@@ -65,7 +68,7 @@ func setupDumpStacks() {
 	// Windows does not support signals like *nix systems. So instead of
 	// trapping on SIGUSR1 to dump stacks, we wait on a Win32 event to be
 	// signaled. ACL'd to builtin administrators and local system
-	event := "Global\\containerd-daemon-" + fmt.Sprint(os.Getpid())
+	event := "Global\\stackdump-" + fmt.Sprint(os.Getpid())
 	ev, _ := windows.UTF16PtrFromString(event)
 	sd, err := winio.SddlToSecurityDescriptor("D:P(A;;GA;;;BA)(A;;GA;;;SY)")
 	if err != nil {
@@ -85,7 +88,30 @@ func setupDumpStacks() {
 		logrus.Debugf("Stackdump - waiting signal at %s", event)
 		for {
 			windows.WaitForSingleObject(h, windows.INFINITE)
-			dumpStacks()
+			dumpStacks(true)
 		}
 	}()
+}
+
+func etwCallback(sourceID guid.GUID, state etw.ProviderState, level etw.Level, matchAnyKeyword uint64, matchAllKeyword uint64, filterData uintptr) {
+	if state == etw.ProviderStateCaptureState {
+		dumpStacks(false)
+	}
+}
+
+func init() {
+	// Provider ID: 2acb92c0-eb9b-571a-69cf-8f3410f383ad
+	// Provider and hook aren't closed explicitly, as they will exist until
+	// process exit. GUID is generated based on name - see
+	// Microsoft/go-winio/tools/etw-provider-gen.
+	provider, err := etw.NewProvider("ContainerD", etwCallback)
+	if err != nil {
+		logrus.Error(err)
+	} else {
+		if hook, err := etwlogrus.NewHookFromProvider(provider); err == nil {
+			logrus.AddHook(hook)
+		} else {
+			logrus.Error(err)
+		}
+	}
 }

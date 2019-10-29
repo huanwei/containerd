@@ -17,26 +17,21 @@ limitations under the License.
 package server
 
 import (
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd"
+	eventtypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/docker/docker/pkg/signal"
+	"github.com/containerd/containerd/log"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	"golang.org/x/sys/unix"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 
+	ctrdutil "github.com/containerd/cri/pkg/containerd/util"
+	"github.com/containerd/cri/pkg/store"
 	containerstore "github.com/containerd/cri/pkg/store/container"
 )
-
-// killContainerTimeout is the timeout that we wait for the container to
-// be SIGKILLed.
-// The timeout is set to 1 min, because the default CRI operation timeout
-// for StopContainer is (2 min + stop timeout). Set to 1 min, so that we
-// have enough time for kill(all=true) and kill(all=false).
-const killContainerTimeout = 1 * time.Minute
 
 // StopContainer stops a running container with a grace period (i.e., timeout).
 func (c *criService) StopContainer(ctx context.Context, r *runtime.StopContainerRequest) (*runtime.StopContainerResponse, error) {
@@ -60,8 +55,9 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 	// Return without error if container is not running. This makes sure that
 	// stop only takes real action after the container is started.
 	state := container.Status.Get().State()
-	if state != runtime.ContainerState_CONTAINER_RUNNING {
-		logrus.Infof("Container to stop %q is not running, current state %q",
+	if state != runtime.ContainerState_CONTAINER_RUNNING &&
+		state != runtime.ContainerState_CONTAINER_UNKNOWN {
+		log.G(ctx).Infof("Container to stop %q must be in running or unknown state, current state %q",
 			id, criContainerStateToString(state))
 		return nil
 	}
@@ -69,84 +65,122 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 	task, err := container.Container.Task(ctx, nil)
 	if err != nil {
 		if !errdefs.IsNotFound(err) {
-			return errors.Wrapf(err, "failed to stop container, task not found for container %q", id)
+			return errors.Wrapf(err, "failed to get task for container %q", id)
+		}
+		// Don't return for unknown state, some cleanup needs to be done.
+		if state == runtime.ContainerState_CONTAINER_UNKNOWN {
+			return cleanupUnknownContainer(ctx, id, container)
 		}
 		return nil
+	}
+
+	// Handle unknown state.
+	if state == runtime.ContainerState_CONTAINER_UNKNOWN {
+		// Start an exit handler for containers in unknown state.
+		waitCtx, waitCancel := context.WithCancel(ctrdutil.NamespacedContext())
+		defer waitCancel()
+		exitCh, err := task.Wait(waitCtx)
+		if err != nil {
+			if !errdefs.IsNotFound(err) {
+				return errors.Wrapf(err, "failed to wait for task for %q", id)
+			}
+			return cleanupUnknownContainer(ctx, id, container)
+		}
+
+		exitCtx, exitCancel := context.WithCancel(context.Background())
+		stopCh := c.eventMonitor.startExitMonitor(exitCtx, id, task.Pid(), exitCh)
+		defer func() {
+			exitCancel()
+			// This ensures that exit monitor is stopped before
+			// `Wait` is cancelled, so no exit event is generated
+			// because of the `Wait` cancellation.
+			<-stopCh
+		}()
 	}
 
 	// We only need to kill the task. The event handler will Delete the
 	// task from containerd after it handles the Exited event.
 	if timeout > 0 {
-		stopSignal := unix.SIGTERM
-		image, err := c.imageStore.Get(container.ImageRef)
-		if err != nil {
-			// NOTE(random-liu): It's possible that the container is stopped,
-			// deleted and image is garbage collected before this point. However,
-			// the chance is really slim, even it happens, it's still fine to return
-			// an error here.
-			return errors.Wrapf(err, "failed to get image metadata %q", container.ImageRef)
-		}
-		if image.ImageSpec.Config.StopSignal != "" {
-			stopSignal, err = signal.ParseSignal(image.ImageSpec.Config.StopSignal)
+		stopSignal := "SIGTERM"
+		if container.StopSignal != "" {
+			stopSignal = container.StopSignal
+		} else {
+			// The image may have been deleted, and the `StopSignal` field is
+			// just introduced to handle that.
+			// However, for containers created before the `StopSignal` field is
+			// introduced, still try to get the stop signal from the image config.
+			// If the image has been deleted, logging an error and using the
+			// default SIGTERM is still better than returning error and leaving
+			// the container unstoppable. (See issue #990)
+			// TODO(random-liu): Remove this logic when containerd 1.2 is deprecated.
+			image, err := c.imageStore.Get(container.ImageRef)
 			if err != nil {
-				return errors.Wrapf(err, "failed to parse stop signal %q",
-					image.ImageSpec.Config.StopSignal)
+				if err != store.ErrNotExist {
+					return errors.Wrapf(err, "failed to get image %q", container.ImageRef)
+				}
+				log.G(ctx).Warningf("Image %q not found, stop container with signal %q", container.ImageRef, stopSignal)
+			} else {
+				if image.ImageSpec.Config.StopSignal != "" {
+					stopSignal = image.ImageSpec.Config.StopSignal
+				}
 			}
 		}
-		logrus.Infof("Stop container %q with signal %v", id, stopSignal)
-		if err = task.Kill(ctx, stopSignal); err != nil && !errdefs.IsNotFound(err) {
+		sig, err := containerd.ParseSignal(stopSignal)
+		if err != nil {
+			return errors.Wrapf(err, "failed to parse stop signal %q", stopSignal)
+		}
+		log.G(ctx).Infof("Stop container %q with signal %v", id, sig)
+		if err = task.Kill(ctx, sig); err != nil && !errdefs.IsNotFound(err) {
 			return errors.Wrapf(err, "failed to stop container %q", id)
 		}
 
-		if err = c.waitContainerStop(ctx, container, timeout); err == nil {
+		sigTermCtx, sigTermCtxCancel := context.WithTimeout(ctx, timeout)
+		defer sigTermCtxCancel()
+		err = c.waitContainerStop(sigTermCtx, container)
+		if err == nil {
+			// Container stopped on first signal no need for SIGKILL
 			return nil
 		}
-		logrus.WithError(err).Errorf("An error occurs during waiting for container %q to be stopped", id)
+		// If the parent context was cancelled or exceeded return immediately
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// sigTermCtx was exceeded. Send SIGKILL
+		log.G(ctx).Debugf("Stop container %q with signal %v timed out", id, sig)
 	}
 
-	logrus.Infof("Kill container %q", id)
-	if err = task.Kill(ctx, unix.SIGKILL, containerd.WithKillAll); err != nil && !errdefs.IsNotFound(err) {
+	log.G(ctx).Infof("Kill container %q", id)
+	if err = task.Kill(ctx, syscall.SIGKILL); err != nil && !errdefs.IsNotFound(err) {
 		return errors.Wrapf(err, "failed to kill container %q", id)
 	}
 
 	// Wait for a fixed timeout until container stop is observed by event monitor.
-	if err = c.waitContainerStop(ctx, container, killContainerTimeout); err == nil {
-		return nil
+	err = c.waitContainerStop(ctx, container)
+	if err != nil {
+		return errors.Wrapf(err, "an error occurs during waiting for container %q to be killed", id)
 	}
-	logrus.WithError(err).Errorf("An error occurs during waiting for container %q to be killed", id)
-
-	// This is a fix for `runc`, and should not break other runtimes. With
-	// containerd.WithKillAll, `runc` will get all processes from the container
-	// cgroups, and kill them. However, sometimes the processes may be moved
-	// out from the container cgroup, e.g. users manually move them by mistake,
-	// or systemd.Delegate=true is not set.
-	// In these cases, we should try our best to do cleanup, kill the container
-	// without containerd.WithKillAll, so that runc can kill the container init
-	// process directly.
-	// NOTE(random-liu): If pid namespace is shared inside the pod, non-init processes
-	// of this container will be left running until the pause container is stopped.
-	logrus.Infof("Kill container %q init process", id)
-	if err = task.Kill(ctx, unix.SIGKILL); err != nil && !errdefs.IsNotFound(err) {
-		return errors.Wrapf(err, "failed to kill container %q init process", id)
-	}
-
-	// Wait for a fixed timeout until container stop is observed by event monitor.
-	if err = c.waitContainerStop(ctx, container, killContainerTimeout); err == nil {
-		return nil
-	}
-	return errors.Wrapf(err, "an error occurs during waiting for container %q init process to be killed", id)
+	return nil
 }
 
-// waitContainerStop waits for container to be stopped until timeout exceeds or context is cancelled.
-func (c *criService) waitContainerStop(ctx context.Context, container containerstore.Container, timeout time.Duration) error {
-	timeoutTimer := time.NewTimer(timeout)
-	defer timeoutTimer.Stop()
+// waitContainerStop waits for container to be stopped until context is
+// cancelled or the context deadline is exceeded.
+func (c *criService) waitContainerStop(ctx context.Context, container containerstore.Container) error {
 	select {
 	case <-ctx.Done():
-		return errors.Errorf("wait container %q is cancelled", container.ID)
-	case <-timeoutTimer.C:
-		return errors.Errorf("wait container %q stop timeout", container.ID)
+		return errors.Wrapf(ctx.Err(), "wait container %q", container.ID)
 	case <-container.Stopped():
 		return nil
 	}
+}
+
+// cleanupUnknownContainer cleanup stopped container in unknown state.
+func cleanupUnknownContainer(ctx context.Context, id string, cntr containerstore.Container) error {
+	// Reuse handleContainerExit to do the cleanup.
+	return handleContainerExit(ctx, &eventtypes.TaskExit{
+		ContainerID: id,
+		ID:          id,
+		Pid:         0,
+		ExitStatus:  unknownExitCode,
+		ExitedAt:    time.Now(),
+	}, cntr)
 }

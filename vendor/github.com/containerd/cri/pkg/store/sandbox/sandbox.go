@@ -22,6 +22,7 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/docker/docker/pkg/truncindex"
 
+	"github.com/containerd/cri/pkg/netns"
 	"github.com/containerd/cri/pkg/store"
 )
 
@@ -32,10 +33,12 @@ type Sandbox struct {
 	Metadata
 	// Status stores the status of the sandbox.
 	Status StatusStorage
-	// Container is the containerd sandbox container client
+	// Container is the containerd sandbox container client.
 	Container containerd.Container
-	// CNI network namespace client
-	NetNS *NetNS
+	// CNI network namespace client.
+	// For hostnetwork pod, this is always nil;
+	// For non hostnetwork pod, this should never be nil.
+	NetNS *netns.NetNS
 	// StopCh is used to propagate the stop information of the sandbox.
 	*store.StopCh
 }
@@ -83,22 +86,9 @@ func (s *Store) Add(sb Sandbox) error {
 	return nil
 }
 
-// Get returns the sandbox with specified id. Returns store.ErrNotExist
-// if the sandbox doesn't exist.
+// Get returns the sandbox with specified id.
+// Returns store.ErrNotExist if the sandbox doesn't exist.
 func (s *Store) Get(id string) (Sandbox, error) {
-	sb, err := s.GetAll(id)
-	if err != nil {
-		return sb, err
-	}
-	if sb.Status.Get().State == StateUnknown {
-		return Sandbox{}, store.ErrNotExist
-	}
-	return sb, nil
-}
-
-// GetAll returns the sandbox with specified id, including sandbox in unknown
-// state. Returns store.ErrNotExist if the sandbox doesn't exist.
-func (s *Store) GetAll(id string) (Sandbox, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	id, err := s.idIndex.Get(id)
@@ -120,9 +110,6 @@ func (s *Store) List() []Sandbox {
 	defer s.lock.RUnlock()
 	var sandboxes []Sandbox
 	for _, sb := range s.sandboxes {
-		if sb.Status.Get().State == StateUnknown {
-			continue
-		}
 		sandboxes = append(sandboxes, sb)
 	}
 	return sandboxes

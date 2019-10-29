@@ -24,9 +24,8 @@ import (
 	"syscall"
 
 	"github.com/containerd/containerd/cio"
-	"github.com/containerd/fifo"
 	"golang.org/x/net/context"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // AttachOptions specifies how to attach to a container.
@@ -113,24 +112,28 @@ func newStdioPipes(fifos *cio.FIFOSet) (_ *stdioPipes, _ *wgCloser, err error) {
 	}()
 
 	if fifos.Stdin != "" {
-		if f, err = fifo.OpenFifo(ctx, fifos.Stdin, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_NONBLOCK, 0700); err != nil {
+		if f, err = openPipe(ctx, fifos.Stdin, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_NONBLOCK, 0700); err != nil {
 			return nil, nil, err
 		}
 		p.stdin = f
 		set = append(set, f)
 	}
 
-	if f, err = fifo.OpenFifo(ctx, fifos.Stdout, syscall.O_RDONLY|syscall.O_CREAT|syscall.O_NONBLOCK, 0700); err != nil {
-		return nil, nil, err
+	if fifos.Stdout != "" {
+		if f, err = openPipe(ctx, fifos.Stdout, syscall.O_RDONLY|syscall.O_CREAT|syscall.O_NONBLOCK, 0700); err != nil {
+			return nil, nil, err
+		}
+		p.stdout = f
+		set = append(set, f)
 	}
-	p.stdout = f
-	set = append(set, f)
 
-	if f, err = fifo.OpenFifo(ctx, fifos.Stderr, syscall.O_RDONLY|syscall.O_CREAT|syscall.O_NONBLOCK, 0700); err != nil {
-		return nil, nil, err
+	if fifos.Stderr != "" {
+		if f, err = openPipe(ctx, fifos.Stderr, syscall.O_RDONLY|syscall.O_CREAT|syscall.O_NONBLOCK, 0700); err != nil {
+			return nil, nil, err
+		}
+		p.stderr = f
+		set = append(set, f)
 	}
-	p.stderr = f
-	set = append(set, f)
 
 	return p, &wgCloser{
 		wg:     &sync.WaitGroup{},

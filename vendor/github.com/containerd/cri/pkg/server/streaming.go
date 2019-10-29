@@ -22,6 +22,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"time"
 
 	"github.com/pkg/errors"
 	k8snet "k8s.io/apimachinery/pkg/util/net"
@@ -64,7 +65,7 @@ func getStreamListenerMode(c *criService) (streamListenerMode, error) {
 	return withoutTLS, nil
 }
 
-func newStreamServer(c *criService, addr, port string) (streaming.Server, error) {
+func newStreamServer(c *criService, addr, port, streamIdleTimeout string) (streaming.Server, error) {
 	if addr == "" {
 		a, err := k8snet.ChooseBindAddress(nil)
 		if err != nil {
@@ -73,6 +74,13 @@ func newStreamServer(c *criService, addr, port string) (streaming.Server, error)
 		addr = a.String()
 	}
 	config := streaming.DefaultConfig
+	if streamIdleTimeout != "" {
+		var err error
+		config.StreamIdleTimeout, err = time.ParseDuration(streamIdleTimeout)
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid stream idle timeout")
+		}
+	}
 	config.Addr = net.JoinHostPort(addr, port)
 	run := newStreamRuntime(c)
 	tlsMode, err := getStreamListenerMode(c)
@@ -147,7 +155,8 @@ func (s *streamRuntime) PortForward(podSandboxID string, port int32, stream io.R
 	if port <= 0 || port > math.MaxUint16 {
 		return errors.Errorf("invalid port %d", port)
 	}
-	return s.c.portForward(podSandboxID, port, stream)
+	ctx := ctrdutil.NamespacedContext()
+	return s.c.portForward(ctx, podSandboxID, port, stream)
 }
 
 // handleResizing spawns a goroutine that processes the resize channel, calling resizeFunc for each
@@ -176,7 +185,7 @@ func handleResizing(resize <-chan remotecommand.TerminalSize, resizeFunc func(si
 
 // newTLSCert returns a self CA signed tls.certificate.
 // TODO (mikebrow): replace / rewrite this function to support using CA
-// signing of the cetificate. Requires a security plan for kubernetes regarding
+// signing of the certificate. Requires a security plan for kubernetes regarding
 // CRI connections / streaming, etc. For example, kubernetes could configure or
 // require a CA service and pass a configuration down through CRI.
 func newTLSCert() (tls.Certificate, error) {

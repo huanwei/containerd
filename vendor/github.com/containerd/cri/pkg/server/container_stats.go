@@ -20,7 +20,7 @@ import (
 	tasks "github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // ContainerStats returns stats of the container. If the container does not
@@ -39,7 +39,7 @@ func (c *criService) ContainerStats(ctx context.Context, in *runtime.ContainerSt
 		return nil, errors.Errorf("unexpected metrics response: %+v", resp.Metrics)
 	}
 
-	cs, err := c.getContainerMetrics(cntr.Metadata, resp.Metrics[0])
+	cs, err := c.containerMetrics(cntr.Metadata, resp.Metrics[0])
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to decode container metrics")
 	}

@@ -21,10 +21,11 @@ import (
 
 	"golang.org/x/net/context"
 
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // ImageFsInfo returns information of the filesystem that is used to store images.
+// TODO(windows): Usage for windows is always 0 right now. Support this for windows.
 func (c *criService) ImageFsInfo(ctx context.Context, r *runtime.ImageFsInfoRequest) (*runtime.ImageFsInfoResponse, error) {
 	snapshots := c.snapshotStore.List()
 	timestamp := time.Now().UnixNano()
